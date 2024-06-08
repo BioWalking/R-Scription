@@ -1,0 +1,276 @@
+library(pheatmap)
+library(survival)
+library(survminer)
+library(tidyverse)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(DESeq2)
+library(dplyr)
+library(TCGAbiolinks)
+library(data.table)
+library(limma)
+library(edgeR)
+gene=read.table("gene.txt")##读取关键基因列表
+combat_Expr=read.csv("combat_Expr.csv",row.names=1)##读取表达数据
+heat=combat_Expr[gene$V1,]##从矩阵选择关键基因
+Group=c(rep("Normal   ", 70), rep("Tumor   ",147))##构建样本分类数据
+annotation_c <- data.frame(Group)
+rownames(annotation_c) <- colnames(heat)
+annotation_colors = list(Group=c(`Normal   ` ='#F8EFBA', `Tumor   `='#FD7272'))
+breaks=c(seq(-3,3,length.out=100))##调整颜色条范围
+##热图
+pheatmap(heat, #表达数据
+cluster_rows = T,#行聚类
+cluster_cols = F,#列聚类
+annotation_col =annotation_c, #样本分类数据
+annotation_colors = annotation_colors,
+annotation_legend=TRUE, # 显示样本分类
+show_rownames = T,# 显示行名
+show_colnames = F,# 显示列名
+scale = "row", #对行标准化
+color =colorRampPalette(c("#0020C2", "#ffffff","#DC143C"))(100),border_color = NA,fontsize = 15,breaks=breaks)
+
+##cox分析
+##下载数据
+query <- GDCquery(project = "TCGA-LAML", 
+                  data.category = "Transcriptome Profiling",
+                  data.type = "Gene Expression Quantification",#选定要下载的数据类型
+                  workflow.type = "STAR - Counts"
+)
+GDCdownload(query, method = "api", files.per.chunk = 100)
+expdat <- GDCprepare(query = query)
+tpm_matrix=assay(expdat,i="tpm_unstrand")
+##ID转换
+tpm_matrix=data.frame(tpm_matrix)
+tpm_matrix$ENSEMBL=rownames(tpm_matrix)
+tpm_matrix$ENSEMBL=unlist(str_split(tpm_matrix$ENSEMBL,"[.]",simplify=T))[,1]##去除版本号
+id=bitr(tpm_matrix$ENSEMBL,fromType = "ENSEMBL",toType = c("SYMBOL"),OrgDb = org.Hs.eg.db)
+tpm=merge(id,tpm_matrix,by="ENSEMBL",all=FALSE)
+tpm<- tpm%>%distinct(`SYMBOL`, .keep_all = T)
+rownames(tpm)=tpm[,2]
+tpm=tpm[,-1:-2]
+rm(tpm_matrix)
+clinical <- GDCquery_clinic(project = "TCGA-LAML", type = "clinical")
+t_needed=c("submitter_id",
+           "vital_status",
+           "days_to_last_follow_up",
+           "days_to_death")
+meta=clinical[,t_needed] #筛选需要的临床信息
+meta=meta[meta$vital_status %in% c('Alive','Dead'),]
+meta$days_to_last_follow_up[is.na(meta$days_to_last_follow_up)] = 0 
+meta$days_to_death[is.na(meta$days_to_death)] = 0
+meta$days<-ifelse(meta$vital_status=='Alive',meta$days_to_last_follow_up,meta$days_to_death)
+meta$month=round(meta$days/30,2)
+ins_genes=rownames(tpm)
+design=data.frame(colnames(tpm))
+design$submitter_id<- str_sub(design$colnames.tpm.,1,12)
+design$submitter_id=gsub('[.]', '-', design$submitter_id)
+sur=merge(design,meta,by="submitter_id")
+sur=sur[sur$month>1,]##筛选存活时间大于1个月的患者
+pick=tpm[gene$V1,]
+pick=data.frame(t(pick))
+pick$colnames.tpm.=rownames(pick)
+cox=merge(sur,pick,by="colnames.tpm.")
+cox$status=ifelse(cox$vital_status=="Alive",0,1)
+##单因素cox
+pFilter=0.05 #设一个p值标准进行筛选,想输出所有基因的数据，可以设置为1
+outResult=data.frame() #建一个空白数据框，后面for循环输出用
+sigGenes=c("status","month") 
+for(i in colnames(cox[,9:(ncol(cox)-1)])){ #从第9列开始循环,前面非基因表达量
+  tdcox <- coxph(Surv(month, status) ~ cox[,i], data = cox)#开始逐一循环cox分析
+  tdcoxSummary = summary(tdcox) #summary命令对tdcox总结，方面后面提取数据
+  pvalue=tdcoxSummary$coefficients[,"Pr(>|z|)"] 
+  if(pvalue<pFilter){ 
+    sigGenes=c(sigGenes,i)
+    outResult=rbind(outResult,#合并行，实际上是对循环结果的合并，前面设置的空白数据框outResult这里用，循环必须有个开始
+                    cbind(id=i,#合并列，是每个基因的统计数据
+                          HR=tdcoxSummary$conf.int[,"exp(coef)"],#提取单个基因的HR
+                          L95CI=tdcoxSummary$conf.int[,"lower .95"],#提取单个基因的HR的95%CI低值
+                          H95CI=tdcoxSummary$conf.int[,"upper .95"],#提取单个基因的HR的95%CI高值
+                          pvalue=tdcoxSummary$coefficients[,"Pr(>|z|)"])#提取单个基因的p值
+    )
+  }
+}
+outResult[,-1]=apply(outResult[,-1],2,as.numeric)##转换数字型
+write.csv(outResult,"univariate_cox.csv",row.names = F)
+###森林图
+outResult[,-1]=round(outResult[,-1],3)##保留三位小数,防止图中显示过长
+##构建绘图数据
+gene <- outResult$id
+hr <- outResult$HR
+hrLow  <- outResult$L95CI
+hrHigh <- outResult$H95CI
+Hazard.ratio <- paste0(hr,"(",hrLow,"-",hrHigh,")")
+pValue <- ifelse(outResult$pvalue<0.001, "<0.001", outResult$pvalue)
+
+n <- nrow(outResult)
+nRow <- n+1
+ylim <- c(1,nRow)
+layout(matrix(c(1,2),nc=2),width=c(2.5,2))
+
+xlim = c(0,2.5)
+par(mar=c(4,2.5,2,1))
+plot(0,xlim=xlim,ylim=ylim,type="n",axes=F,xlab="",ylab="")
+text.cex=0.8
+text(0,n:1,gene,adj=0,cex=text.cex)
+text(1.2-0.5*0.2,n:1,pValue,adj=1,cex=text.cex);text(1.2-0.5*0.2,n+1,'pvalue',cex=text.cex,font=2,adj=1)
+text(2.5,n:1,Hazard.ratio,adj=1,cex=text.cex);text(2.5,n+1,'Hazard ratio',cex=text.cex,font=2,adj=1,)
+
+par(mar=c(4,1,2,1),mgp=c(2,0.5,0))
+xlim = c(0,max(as.numeric(hrLow),as.numeric(hrHigh)))
+plot(0,xlim=xlim,ylim=ylim,type="n",axes=F,ylab="",xaxs="i",xlab="Hazard ratio")
+arrows(as.numeric(hrLow),n:1,as.numeric(hrHigh),n:1,angle=90,code=3,length=0.05,col="darkblue",lwd=2.5)
+abline(v=1,col="black",lty=2,lwd=2)
+boxcolor = ifelse(as.numeric(hr) > 1, 'red', 'green')
+points(as.numeric(hr), n:1, pch = 15, col = boxcolor, cex=1.3)
+axis(1)
+##多因素cox
+tdmultiCox=coxph(Surv(month, status) ~SOCS1+PTPN6+MYB+LPCAT3+PGRMC1+SLC25A28+BNIP3+VDR+FTH1+G6PD+SREBF1+DDIT4+PRDX1+SRC+CISD3+FADS1, data = cox) #选择单因素cox分析中p值小于0.05的基因
+tdmultiCoxSum=summary(tdmultiCox)
+outResult=data.frame()
+outResult=cbind(
+  HR=tdmultiCoxSum$conf.int[,"exp(coef)"],
+  L95CI=tdmultiCoxSum$conf.int[,"lower .95"],
+  H95CIH=tdmultiCoxSum$conf.int[,"upper .95"],
+  pvalue=tdmultiCoxSum$coefficients[,"Pr(>|z|)"])
+outResult=cbind(id=row.names(outResult),outResult)
+outResult=data.frame(outResult)
+write.csv(outResult,"multi_cox.csv",row.names = F)
+##森林图
+outResult[,-1]=apply(outResult[,-1],2,as.numeric)
+outResult[,-1]=round(outResult[,-1],3)##保留三位小数,防止图中显示过长
+##构建绘图数据
+gene <- outResult$id
+hr <- outResult$HR
+hrLow  <- outResult$L95CI
+hrHigh <- outResult$H95CI
+Hazard.ratio <- paste0(hr,"(",hrLow,"-",hrHigh,")")
+pValue <- ifelse(outResult$pvalue<0.001, "<0.001", outResult$pvalue)
+
+n <- nrow(outResult)
+nRow <- n+1
+ylim <- c(1,nRow)
+layout(matrix(c(1,2),nc=2),width=c(2.5,2))
+
+xlim = c(0,2.5)
+par(mar=c(4,2.5,2,1))
+plot(0,xlim=xlim,ylim=ylim,type="n",axes=F,xlab="",ylab="")
+text.cex=0.8
+text(0,n:1,gene,adj=0,cex=text.cex)
+text(1.2-0.5*0.2,n:1,pValue,adj=1,cex=text.cex);text(1.2-0.5*0.2,n+1,'pvalue',cex=text.cex,font=2,adj=1)
+text(2.5,n:1,Hazard.ratio,adj=1,cex=text.cex);text(2.5,n+1,'Hazard ratio',cex=text.cex,font=2,adj=1,)
+
+par(mar=c(4,1,2,1),mgp=c(2,0.5,0))
+xlim = c(0,max(as.numeric(hrLow),as.numeric(hrHigh)))
+plot(0,xlim=xlim,ylim=ylim,type="n",axes=F,ylab="",xaxs="i",xlab="Hazard ratio")
+arrows(as.numeric(hrLow),n:1,as.numeric(hrHigh),n:1,angle=90,code=3,length=0.05,col="darkblue",lwd=2.5)
+abline(v=1,col="black",lty=2,lwd=2)
+boxcolor = ifelse(as.numeric(hr) > 1, 'red', 'green')
+points(as.numeric(hr), n:1, pch = 15, col = boxcolor, cex=1.3)
+axis(1)
+##临床数据表格
+clinical <- GDCquery_clinic(project = "TCGA-LAML", type = "clinical")
+##第二种
+query <- GDCquery(
+  project = "TCGA-LAML",
+  data.category = "Clinical",
+  data.format = "BCR XML"
+)
+GDCdownload(query)
+clinical.stage <- GDCprepare_clinic(query,"stage_event")##可把"stage_event"换成"follow up","radiation","patient","drug","new_tumor_event"
+ ins_clin=c("submitter_id",
+            "gender",
+            "vital_status",
+            "age_at_index",
+            "days_to_last_follow_up",
+            "days_to_death")##选择感兴趣的临床特征
+ metadata=clinical[,ins_clin]##table()查看各个特征的分布
+ metadata$days_to_last_follow_up[is.na(metadata$days_to_last_follow_up)] = 0 #is.na()用于返回是否为缺失值
+ metadata$days_to_death[is.na(metadata$days_to_death)] = 0
+ metadata$days<-ifelse(metadata$vital_status=='Alive',metadata$days_to_last_follow_up,metadata$days_to_death)
+ metadata=metadata[metadata$days>30,]##筛选存活时间大于1个月的患者
+ No.patients=data.frame(nrow(metadata))##患者数量
+ Age=data.frame(as.matrix(summary(metadata$age_at_index)))
+ Age=data.frame(Age[c(1,3,4,6),])
+ rownames(Age)=c("Min","Median","Mean","Max")##年龄信息
+ Gender=data.frame(table(metadata$gender))##性别信息
+ stage=data.frame(table(metadata$vital_status))##分期信息
+ survival=data.frame(table(metadata$vital_status))##生存信息
+ ST=data.frame(median(metadata$days))##存活时间信息
+ write.csv(metadata,"clinical.csv",row.names = F)
+ ##Lasso
+ library(glmnet) 
+ library(car)  
+ library(corrplot)
+ library(survival) 
+ library(dplyr) 
+ library(ggpubr) 
+ library(patchwork) 
+ library(ROCR)  
+ library(caret) 
+ # 对所有列的数据进行Kolmogorov-Smirnov循环检验
+ ks_result <- data.frame("Gene" = character(), "p.value" = numeric())
+ for (i in 3:length(colnames(lasso))){
+   p.value <- ks.test(lasso[,i], pnorm, mean = mean(lasso[,i]), sd = sd(lasso[,i]))$p.value
+   Gene <- colnames(lasso)[i]
+   tmp <- data.frame(Gene = Gene,
+                     p.value = p.value)
+   ks_result <- rbind(ks_result, tmp)
+ }
+ max(ks_result$p.value)##查看最大的p值,如果大于0.05，说明数据符合正态分布
+ cor_matrix <- cor(lasso[,3:ncol(lasso)], use = "everything", method = c("spearman"))
+ corrplot(cor_matrix, type = "upper", method = "color", tl.cex = 0.8, tl.col = "black", order = "AOE")
+ corrplot.mixed(cor_matrix, tl.cex = 0.6, tl.col = "black") # 如果相关性小于0.8的话，则认为这份数据的多重共线性问题并不严重
+ model <- coxph(Surv(month, status) ~ ., data =lasso)
+ vif(model)
+ plot(vif(model),
+      xlim = c(0,35), ylim = c(0,10),
+      xlab = "variables", ylab = "VIF",
+      cex = 3, pch = 1)
+ 
+ ##构建模型
+ time <- lasso[,"month"]
+ status <- lasso[,"status"]
+ x <- as.matrix(lasso[,-c(1,2)])  # x为输入特征，应该是矩阵格式。否则数据框的数据会报错：Error in lognet...(串列)对象不能强制改变成'double'种类
+ y <- as.matrix(lasso$status )
+lasso <- glmnet(x = x, y = y,
+                family = "binomial",
+                alpha = 1,  # alpha = 1为LASSO回归，= 0为岭回归，0和1之间则为弹性网络  
+                nlambda = 100)  # nlambda表示正则化路径中的个数，这个参数就可以起到一个阈值的作用，决定有多少基因的系数可以留下来。默认值为100。
+print(lasso)
+##Df：自由度，表示使用的变量数量，
+##%Dev：代表了由模型解释的残差的比例。对于线性模型来说就是模型拟合的R^2(R-squred)。它在0%和100%之间，越接近100%说明模型包括了越多样本的信息，表现越好，如果是0%，说明模型的预测结果还不如直接把因变量的均值作为预测值来的有效。解释的残差百分比越高越好，但是构建模型使用的基因的数量也不能太多，需要取一个折中值。
+##Lambda：表示使用的正则化系数，是构建模型的重要参数。数量和nlambda的值一致。
+plot(lasso, xvar = "lambda", label = TRUE)  # 系数分布图，由“log-lambda”与变量系数作图，展示根据lambda的变化情况每一个特征的系数变化，展示了Lasso回归筛选变量的动态过程
+plot(lasso, xvar = "dev", label = TRUE)  # 也可以对%dev绘图
+plot(lasso, xvar = "norm", label = TRUE)  # “L1范数”与变量系数作图
+##交叉验证
+set.seed(1234567)  # 设置种子数，保证每次得到的交叉验证图是一致的
+# 计算100个λ，画图，筛选表现最好的λ值
+lasso_cv <- cv.glmnet(x = x, y = y, family = "binomial", alpha = 1, nlambda = 100)  # 交叉验证，如果结果不理想，可以重新单独运行这一行代码，或者换一下种子数
+plot(lasso_cv)##这张图上有两条虚线，这两条虚线分别指示了两个特殊的λ值： 左边是lambda.min(平均误差最小时的λ值)，右边是lambda.1se(平均误差在一个标准差以内的最大λ值)。这两个值之间的lambda都认为是合适的。lambda.1se构建的模型使用的基因数量少，一般不用。而lambda.min则准确率更高一点，使用的基因数量更多一点。一般会选择lambda.min。
+
+##选择lambda
+lambda <- lasso_cv$lambda.min
+coef_lasso_cv <- coef(lasso, s = lambda)  #查看每个变量的回归系数。s为lasso回归结果中的lambda值，可以得到相应数量的变量的回归系数
+coef_lasso_cv[,1][coef_lasso_cv[,1]!=0]
+exp(coef_lasso_cv[,1][coef_lasso_cv[,1]!=0])  #计算自然对数 自然对数的指数函数，它的定义为exp(x) = e^x，其中e是自然对数的底数（约等于2.718），回归系数<0的exp>1，反之<1。
+##重新建模
+model_lasso_min <- glmnet(x = x, y = y, alpha = 1, lambda = lasso_cv$lambda.min)
+# 这两个值体现在参数lambda上。有了模型，可以将筛选的基因挑出来了。
+# 所有基因存放于model_lasso_min模型的子集beta中，用到的基因有一个s0值，没用的基因只记录了“.”，所以可以用下面代码挑出用到的基因。
+model_lasso_min$beta[,1][model_lasso_min$beta[,1]!=0]
+choose_gene_min = rownames(model_lasso_min$beta)[as.numeric(model_lasso_min$beta) != 0]
+##模型预测
+lasso.prob <- predict(lasso_cv, newx = x, s = c(lasso_cv$lambda.min, lasso_cv$lambda.1se))
+re = data.frame(cbind(y, lasso.prob))##把生存结局和预测概率合并
+colnames(re) = c("event", "prob_min", "prob_1se") 
+pred_min <- prediction(re[,2], re[,1])  # 用预测值匹配真实值，计算预测值的准确率。将输入数据转换为标准化格式。
+auc_min = performance(pred_min, "auc")@y.values[[1]]  # 计算AUC(ROC 曲线下的面积)
+perf_min <- performance(pred_min, "tpr", "fpr")  # 计算True positive rate（真阳性率，敏感性）和False positive rate（假阳性率，1-特异性）
+plot(perf_min, colorize = FALSE, col = "blue")  # 用"tpr"和"fpr"画ROC曲线
+lines(c(0,1), c(0,1), col = "gray", lty = 4)  # 给ROC曲线加上参考线
+text(0.8, 0.2, labels = paste0("AUC = ", round(auc_min, 3))) 
+lasso_result=data.frame((coef_lasso_cv2[,1][coef_lasso_cv2[,1]!=0])[-1])
+colnames(lasso_result) <- "coef"
+write.csv(lasso_result,"gene_coef.csv")
