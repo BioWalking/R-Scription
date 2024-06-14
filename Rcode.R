@@ -2,6 +2,7 @@ library(WGCNA)
 library(RColorBrewer)
 library(GEOquery)
 library(org.Hs.eg.db)
+library(pheatmap)
 data=read.table("GSE256068_processed_data.txt",
                 sep = " ",
                 fileEncoding = "UTF-16LE",
