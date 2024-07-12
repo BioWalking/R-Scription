@@ -198,7 +198,7 @@ clinical.stage <- GDCprepare_clinic(query,"stage_event")##可把"stage_event"换
  survival=data.frame(table(metadata$vital_status))##生存信息
  ST=data.frame(median(metadata$days))##存活时间信息
  write.csv(metadata,"clinical.csv",row.names = F)
- ##Lasso
+ ##Lasso cox
  library(glmnet) 
  library(car)  
  library(corrplot)
