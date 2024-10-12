@@ -1,5 +1,6 @@
 library(Seurat)
 library(CellChat)
+library(future)
 Con=pbmc[,pbmc$Group %in% c( "Control")]
 OA=pbmc[,pbmc$Group %in% c( "OA")]
 cellChat_Con <- createCellChat(object = Con, group.by = "celltype", assay = "RNA")
